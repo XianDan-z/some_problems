@@ -1,0 +1,2109 @@
+╭─── Claude Code v2.1.181 ─────────────────────────────────────────────────────╮
+│                                         │ Tips for getting started           │
+│              Welcome back!              │ Run /init to create a CLAUDE.md f… │
+│                                         │ ────────────────────────────────── │
+│                 ▐▛███▜▌                 │ What's new                         │
+│                ▝▜█████▛▘                │ Added `/config key=value` syntax … │
+│                  ▘▘ ▝▝                  │ Added `sandbox.allowAppleEvents` … │
+│                                         │ Added `CLAUDE_CLIENT_PRESENCE_FIL… │
+│   deepseek-v4-pro · API Usage Billing   │ /release-notes for more            │
+│           /data/zyue/rocksdb            │                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+❯ 请详细解释rocksdb的randomseek、scan的详细流程，对照着代码进行讲解，列出详细的 
+  函数调用流程                                                                  
+
+  Thought for 4s (ctrl+o to expand)
+
+● 我来详细分析 RocksDB 的 RandomSeek 和 Scan
+  流程。首先需要探索代码库中相关的代码路径。
+
+● Explore(Explore RocksDB Seek/Scan code)
+  ⎿  Done (92 tool uses · 98.1k tokens · 2m 34s)
+  (ctrl+o to expand)
+
+  Thought for 3s (ctrl+o to expand)
+
+● Now let me read the key source files to provide detailed code-level tracing.
+
+  Thought for 11s, read 7 files (ctrl+o to expand)
+
+● 现在我已经阅读了所有关键代码，下面给出详细的解释。
+
+  ---
+  RocksDB RandomSeek (Get) 与 Scan (Iterator) 详细流程
+
+  一、核心概念与架构概览
+
+  RocksDB 使用 LSM-Tree 架构，数据分布在：
+  1. MemTable — 内存中的活跃写入缓冲（skiplist/哈希链）
+  2. Immutable MemTables — 等待刷盘的只读 MemTable
+  3. SST Files (L0~Ln) — 磁盘上的排序文件
+
+  RandomSeek (Get) 是按 key 进行点查；Scan (Iterator)
+  是基于迭代器的范围扫描。两者共享查询 SuperVersion（包含 mem + imm + current
+  Version）的路径，但 Iterator 还额外通过 MergingIterator
+  将多个数据源合并为一个有序流。
+
+  ---
+  二、RandomSeek (Get) 代码调用流程
+
+  2.1 总体调用链
+
+  DBImpl::Get()                          // db/db_impl/db_impl.cc:1696
+    └─ DBImpl::GetImpl()                 // db/db_impl/db_impl.cc:1724
+         ├─ [1] GetAndRefSuperVersion()  // 获取 SuperVersion (mem+imm+sst)
+         ├─ [2] LookupKey::LookupKey()   // 构造查找键
+         ├─ [3] MemTable::Get()          // memtable.cc:862  查活跃memtable
+         │    ├─ bloom_filter_->MayContain()  // Bloom过滤
+         │    ├─ NewRangeTombstoneIterator()  // Range Delete 处理
+         │    └─ GetFromTable()               // memtable.cc:923
+         │         └─ MemTableRep::Get()      // memtable.cc:1229
+         │              └─ Seek() + Next() 循环，对每条entry回调 SaveValue()
+         ├─ [4] MemTableListVersion::Get()  // 查immutable memtables
+         ├─ [5] Version::Get()              // version_set.cc:1981  查SST文件
+         │    ├─ GetContext 初始化           // table/get_context.h:67
+         │    ├─ FilePicker::GetNextFile()   // version_set.cc:162 逐文件搜索
+         │    └─ TableCache::Get()           // table_cache.cc:396
+         │         ├─ FindTable()            // 打开/缓存查找SST reader
+         │         ├─ RowCache 检查
+         │         └─ BlockBasedTable::Get() // block_based_table_reader.cc:2329
+         │              ├─ FullFilterKeyMayMatch()  // 全量 Bloom Filter
+         │              ├─ NewIndexIterator()       // 创建索引迭代器
+         │              ├─ iiter->Seek(key)         // 索引二分查找
+         │              ├─ 逐data block检查 bloom + key range
+         │              ├─ NewDataBlockIterator()   // 读取数据块
+         │              ├─ biter.SeekForGet(key)    // 数据块内哈希/Binary查找
+         │              └─ get_context->SaveValue() // 处理找到的值
+         └─ [6] MergeHelper::TimedFullMerge() // 最终merge (如果需要)
+
+  2.2 详细逐步讲解
+
+  Step 1: 入口 — DBImpl::GetImpl() (db/db_impl/db_impl.cc:1724)
+
+  // 1. 获取 SuperVersion —— 包含当前memtable、immutable memtables、current 
+  Version
+  SuperVersion* sv = GetAndRefSuperVersion(cfd);   // line 1763
+
+  // 2. 确定 snapshot 序列号
+  if (read_options.snapshot != nullptr) {
+      snapshot = reinterpret_cast<const
+  SnapshotImpl*>(read_options.snapshot)->number_;
+  } else {
+      snapshot = versions_->LastSequence();         // line 1784
+  }
+
+  // 3. 构造 LookupKey —— 将 user_key + sequence + type 编码为一个 InternalKey
+  LookupKey lkey(key, snapshot, read_options.timestamp);  // line 1828
+
+  LookupKey (db/lookup_key.h:19) 的内存布局：
+  [varint32 key_length][user_key bytes][sequence << 8 | type (8 bytes)]
+  提供三个视图：
+  - memtable_key() — 完整编码形式（含 varint32 长度前缀），用于 MemTable 查找
+  - internal_key() — user_key + tag(seq+type)，用于 SST 查找
+  - user_key() — 纯用户 key
+
+  Step 2: 查 MemTable (db/memtable.cc:862)
+
+  // MemTable::Get() - line 862-921
+  bool MemTable::Get(const LookupKey& key, ...) {
+      // 2.1 Bloom filter 快速过滤（line 889-899）
+      if (bloom_filter_) {
+          may_contain = bloom_filter_->MayContain(user_key_without_ts);
+      }
+      if (!may_contain) {
+          *seq = kMaxSequenceNumber;   // 不存在，跳过
+      } else {
+          // 2.2 实际查找
+          GetFromTable(key, ...);      // line 910
+      }
+  }
+
+  MemTable::GetFromTable() (db/memtable.cc:923-952) 构造 Saver
+  结构体，然后调用：
+  table_->Get(key, &saver, SaveValue);  // line 950
+
+  MemTableRep::Get() (db/memtable.cc:1229-1236) 是底层跳表/哈希表的查找：
+  void MemTableRep::Get(const LookupKey& k, void* callback_args,
+                        bool (*callback_func)(void* arg, const char* entry)) {
+      auto iter = GetDynamicPrefixIterator();
+      // Seek到目标位置，然后线性扫描相同user_key的所有版本
+      for (iter->Seek(k.internal_key(), k.memtable_key().data());
+           iter->Valid() && callback_func(callback_args, iter->key());
+           iter->Next()) {
+      }
+  }
+
+  SaveValue 回调 (db/memtable.cc:699) 处理每条找到的记录：
+  static bool SaveValue(void* arg, const char* entry) {
+      // 解析 entry: klength + userkey + tag + vlength + value
+      // 检查 user_key 是否匹配
+      // 检查 snapshot 可见性
+      // 根据 type 处理:
+      switch (type) {
+          case kTypeValue:     // 找到值 -> 设置 *found_final_value = 
+  true，return false(停止)
+          case kTypeDeletion:  // 删除标记 -> return false(停止)
+          case kTypeMerge:     // Merge操作 -> 收集操作数，继续查找
+          case kTypeBlobIndex: // Blob索引 -> 类似 kTypeValue
+      }
+  }
+
+  Step 3: 查 SST 文件 — Version::Get() (db/version_set.cc:1981)
+
+  这是最复杂的部分。核心思想：逐层、逐文件地搜索，直到找到或确定不存在。
+
+  void Version::Get(const ReadOptions& read_options, const LookupKey& k, ...) {
+      // 3.1 创建 GetContext —— 状态机，跟踪查找状态
+      GetContext get_context(
+          ..., status->ok() ? GetContext::kNotFound : GetContext::kMerge,
+          user_key, value, ..., merge_context, ...);   // line 2011-2017
+
+      // 3.2 创建 FilePicker —— 跨层级、跨文件迭代器
+      FilePicker fp(storage_info_.files_, user_key, ikey, ...);  // line 
+  2024-2027
+
+      // 3.3 逐文件搜索
+      FdWithKeyRange* f = fp.GetNextFile();            // line 2028
+      while (f != nullptr) {
+          // 调用 TableCache::Get 查找每个文件
+          *status = table_cache_->Get(read_options, *internal_comparator(),
+                                       *f->file_metadata, ikey, &get_context,
+  ...);
+          // 根据 GetContext 状态机决定下一步
+          switch (get_context.State()) {
+              case kNotFound: break;       // 继续搜索下一个文件
+              case kMerge:    break;       // 需要更多merge操作数，继续
+              case kFound:    return;      // 找到了！
+              case kDeleted:  *status = Status::NotFound(); return;
+              case kCorrupt:  return;
+          }
+          f = fp.GetNextFile();            // 获取下一个可能包含key的文件
+      }
+
+      // 3.4 最终 merge（如果遍历完所有文件后仍处于 kMerge 状态）
+      if (GetContext::kMerge == get_context.State()) {
+          *status = MergeHelper::TimedFullMerge(...);  // line 2136
+      }
+  }
+
+  FilePicker::GetNextFile() (db/version_set.cc:162-247) 的搜索策略：
+  - Level 0: 遍历所有文件（L0 文件之间可能重叠），按 key range 过滤
+  - Level 1+: 文件按 key 排序且不重叠，使用二分查找定位起始文件；利用
+  FileIndexer 实现**分数级联（Fractional Cascading）**优化下层查找范围
+  - 对于每个文件，检查 user_key 是否在其 [smallest_key, largest_key] 范围内
+
+  Step 4: TableCache::Get() (db/table_cache.cc:396)
+
+  Status TableCache::Get(...) {
+      // 4.1 Row cache 检查（可选，缓存完整的 key->value 映射）
+      if (ioptions_.row_cache && !get_context->NeedToReadSequence()) {
+          done = GetFromRowCache(user_key, row_cache_key, ...);
+      }
+
+      // 4.2 打开或从缓存获取 SST TableReader
+      if (t == nullptr) {
+          s = FindTable(options, ..., fd, &handle, ...);  // line 428
+          // FindTable 会先查 block cache，miss则打开文件、读footer、读index 
+  block等
+      }
+
+      // 4.3 创建 RangeTombstoneIterator（如果需要）
+      // 4.4 调用具体的 TableReader::Get()
+      s = t->Get(options, k, get_context, prefix_extractor, skip_filters);  // 
+  line 452
+      // 对于 BlockBasedTable，这就是 BlockBasedTable::Get()
+  }
+
+  Step 5: BlockBasedTable::Get() 
+  (table/block_based/block_based_table_reader.cc:2329)
+
+  这是 SST 文件内部查找的核心：
+
+  Status BlockBasedTable::Get(...) {
+      // 5.1 全量 Bloom Filter 检查
+      const bool may_match = FullFilterKeyMayMatch(read_options, filter, key,
+  ...);  // line 2354
+      if (!may_match) {
+          return;  // 布隆过滤器确定不存在，直接返回
+      }
+
+      // 5.2 创建索引迭代器（遍历 index block 中的 <key, BlockHandle> 对）
+      auto iiter = NewIndexIterator(read_options, ...);  // line 2370-2372
+
+      // 5.3 遍历索引，寻找可能包含key的数据块
+      for (iiter->Seek(key); iiter->Valid() && !done; iiter->Next()) {  // line 
+  2382
+          IndexValue v = iiter->value();  // 包含 BlockHandle (offset + size)
+
+          // 5.3a 数据块级别的 Bloom Filter 检查（block-based filter）
+          if (filter->IsBlockBased() && !filter->KeyMayMatch(...))
+              break;  // line 2386-2398
+
+          // 5.3b Key between blocks 检查 —— 如果 seek key 落在两个block之间
+          if (Compare(ExtractUserKey(key), ExtractUserKey(v.first_internal_key))
+  < 0)
+              break;  // line 2401-2409
+
+          // 5.3c 读取数据块（从 cache 或磁盘）
+          NewDataBlockIterator<DataBlockIter>(read_options, v.handle, &biter,
+  ...);  // line 2418
+
+          // 5.3d 在数据块中查找
+          bool may_exist = biter.SeekForGet(key);  // line 2436
+          // SeekForGet 使用哈希索引加速，失败则回退到二分查找
+
+          // 5.3e 遍历数据块中的条目，调用 GetContext::SaveValue
+          for (; biter.Valid(); biter.Next()) {     // line 2447
+              ParsedInternalKey parsed_key;
+              ParseInternalKey(biter.key(), &parsed_key, ...);
+              if (!get_context->SaveValue(parsed_key, biter.value(), &matched,
+  ...)) {
+                  done = true;  // SaveValue 返回 false 表示找到了或可以停下来了
+                  break;
+              }
+          }
+      }
+  }
+
+  索引结构：
+  SST File
+  ├── Data Block 1  (key range: [a, d])
+  ├── Data Block 2  (key range: [e, h])
+  ├── ...
+  ├── Index Block    (key -> BlockHandle 映射)
+  │   ├── "d" -> BlockHandle(offset=..., size=...)
+  │   ├── "h" -> BlockHandle(...)
+  │   └── ...
+  ├── Filter Block   (Bloom Filter)
+  └── Footer
+
+  Step 6: DataBlockIter::SeekForGetImpl() (table/block_based/block.cc:276)
+
+  数据块内的查找优化：
+
+  bool DataBlockIter::SeekForGetImpl(const Slice& target) {
+      // 6.1 尝试哈希索引查找
+      uint8_t entry = data_block_hash_index_->Lookup(data_, map_offset,
+  target_user_key);
+
+      if (entry == kCollision) {
+          SeekImpl(target);     // 哈希冲突，回退到二分查找
+          return true;
+      }
+      if (entry == kNoEntry) {
+          // 哈希索引没找到，但可能在下个block中，将位置设在最后一个restart 
+  interval
+          entry = num_restarts_ - 1;
+      }
+
+      // 6.2 从 restart point 开始线性扫描
+      SeekToRestartPoint(restart_index);
+      while (ParseNextDataKey<DecodeEntry>(limit) && CompareCurrentKey(target) <
+  0) {
+          // 在 restart interval 内线性查找
+      }
+
+      // 6.3 检查是否找到
+      if (current_ == restarts_) return true;           // 可能在下个block
+      if (Compare(raw_key_.GetUserKey(), target_user_key) != 0) return false;
+  // 不存在
+      return true;
+  }
+
+  ---
+  三、Scan (Iterator) 代码调用流程
+
+  3.1 总体调用链
+
+  DBImpl::NewIterator()                  // db/db_impl/db_impl.cc:2891
+    └─ DBImpl::NewIteratorImpl()        // db/db_impl/db_impl.cc:2943
+         ├─ NewArenaWrappedDbIterator() // 创建 ArenaWrappedDBIter (含 DBIter)
+         ├─ NewInternalIterator()       // db/db_impl/db_impl.cc:1633
+         │    ├─ MergeIteratorBuilder   // 构建 MergingIterator
+         │    ├─ mem->NewIterator()     // MemTable 迭代器
+         │    ├─ imm->AddIterators()    // Immutable MemTable 迭代器
+         │    ├─ current->AddIterators() // 各层 SST 文件迭代器
+         │    └─ MergeIteratorBuilder::Finish()  // 合并所有子迭代器
+         └─ SetIterUnderDBIter()        // 将 MergingIterator 注入 DBIter
+
+  Iterator 操作流程:
+
+  DBIter::Seek(target)                   // db/db_iter.cc:1341
+    ├─ SetSavedKeyToSeekTarget(target)   // 构造 seek 用的 internal key
+    ├─ iter_.Seek(saved_key_)           // MergingIterator -> 各子迭代器
+    └─ FindNextUserEntry(false, prefix)  // 找第一个可见的用户key
+
+  DBIter::Next()                          // db/db_iter.cc:128
+    ├─ ReverseToForward()                // 如果在反向模式下，先转向
+    ├─ iter_.Next()                      // 跳过当前entry
+    └─ FindNextUserEntry(true, prefix)   // 找下一个可见key
+
+  DBIter::Prev()                          // db/db_iter.cc:648
+    ├─ ReverseToBackward()               // 切换到反向
+    └─ PrevInternal(prefix)              // 向后扫描
+         ├─ FindValueForCurrentKey()     // 确定当前用户key的最新值
+         └─ FindUserKeyBeforeSavedKey()  // 移到前一个用户key
+
+  DBIter::SeekToFirst()                   // db/db_iter.cc:1485
+    └─ iter_.SeekToFirst() + FindNextUserEntry()
+
+  DBIter::SeekToLast()                    // db/db_iter.cc:1533
+    └─ iter_.SeekToLast() + PrevInternal()
+
+  3.2 详细逐步讲解
+
+  Step 1: 创建 Iterator — NewIteratorImpl() (db/db_impl/db_impl.cc:2943)
+
+  ArenaWrappedDBIter* DBImpl::NewIteratorImpl(...) {
+      // 1.1 获取 SuperVersion
+      SuperVersion* sv = cfd->GetReferencedSuperVersion(this);
+
+      // 1.2 计算 snapshot（如果没有指定，使用最新序列号）
+      if (snapshot == kMaxSequenceNumber) {
+          snapshot = versions_->LastSequence();
+      }
+
+      // 1.3 创建 ArenaWrappedDBIter（内存布局缓存友好）
+      // 在同一块连续内存中分配整个迭代器树
+      ArenaWrappedDBIter* db_iter = NewArenaWrappedDbIterator(
+          ..., snapshot, ...);
+
+      // 1.4 构建内部迭代器树（MergingIterator）
+      InternalIterator* internal_iter = NewInternalIterator(
+          db_iter->GetReadOptions(), cfd, sv, db_iter->GetArena(),
+          db_iter->GetRangeDelAggregator(), snapshot, ...);
+
+      // 1.5 建立关联
+      db_iter->SetIterUnderDBIter(internal_iter);
+      return db_iter;
+  }
+
+  迭代器树的内存布局（代码注释中的 ASCII 图，line 2969-3004）：
+  ArenaWrappedDBIter
+    └── DBIter
+         └── MergingIterator
+              ├── Iterator1 (MemTable)
+              ├── Iterator2 (Immutable MemTable)
+              ├── Iterator3 (L0 SST via TwoLevelIterator)
+              ├── Iterator4 (L1 SST)
+              └── ...
+
+  Step 2: 构建 MergingIterator — NewInternalIterator() 
+  (db/db_impl/db_impl.cc:1633)
+
+  InternalIterator* DBImpl::NewInternalIterator(..., SuperVersion*
+  super_version, ...) {
+      // 2.1 创建 MergeIteratorBuilder
+      MergeIteratorBuilder merge_iter_builder(&cfd->internal_comparator(),
+  arena, ...);
+
+      // 2.2 添加 MemTable 迭代器
+      merge_iter_builder.AddIterator(
+          super_version->mem->NewIterator(read_options, arena));  // line 
+  1649-1650
+
+      // 2.3 添加 RangeTombstone 迭代器（MemTable 部分）
+      range_del_iter.reset(super_version->mem->NewRangeTombstoneIterator(...));
+      range_del_agg->AddTombstones(std::move(range_del_iter));
+
+      // 2.4 添加 Immutable MemTable 迭代器
+      super_version->imm->AddIterators(read_options, &merge_iter_builder);
+  // line 1660
+      super_version->imm->AddRangeTombstoneIterators(read_options, arena, ...);
+
+      // 2.5 添加各层 SST 文件迭代器
+      super_version->current->AddIterators(read_options, ...,
+  &merge_iter_builder, ...);  // line 1670
+
+      // 2.6 构建最终的 MergingIterator
+      internal_iter = merge_iter_builder.Finish();  // line 1674
+  }
+
+  MergingIterator 的工作原理：它是一个多路归并迭代器，维护一个最小堆，Seek()
+  时对所有子迭代器进行 Seek，然后每次 Next() 从堆顶（最小
+  key）取出并前进对应的子迭代器。
+
+  Step 3: DBIter::Seek() (db/db_iter.cc:1341)
+
+  void DBIter::Seek(const Slice& target) {
+      // 3.1 将 user_key 转换为 internal key（用于底层查找）
+      SetSavedKeyToSeekTarget(target);                 // line 1372
+      // 构造: user_key + kMaxSequenceNumber + kValueTypeForSeek
+      // 用最大seqno确保找到该key的最新版本
+
+      // 3.2 Seek MergingIterator
+      iter_.Seek(saved_key_.GetInternalKey());         // line 1373
+
+      if (!iter_.Valid()) {
+          valid_ = false; return;
+      }
+      direction_ = kForward;
+
+      // 3.3 从当前位置找到第一个对用户可见的key
+      FindNextUserEntry(false /* not skipping saved_key */, nullptr);
+      // 这个函数处理: snapshot可见性、删除标记、Merge操作、前缀过滤等
+  }
+
+  SetSavedKeyToSeekTarget() (db/db_iter.cc:1295) 构造 seek 用的 internal key：
+  void DBIter::SetSavedKeyToSeekTarget(const Slice& target) {
+      // seek_key = user_key + sequence_ + kValueTypeForSeek
+      // 使用 snapshot sequence 确保找到对该快照可见的最新版本
+      AppendInternalKey(&saved_key_, ParsedInternalKey(target, sequence_,
+  kValueTypeForSeek));
+  }
+
+  Step 4: DBIter::FindNextUserEntryInternal() (db/db_iter.cc:229)
+
+  这是 DBIter 最核心的 forward scan 逻辑，一个大的 do-while 循环：
+
+  bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key, const Slice* 
+  prefix) {
+      do {
+          // 4.1 解析当前 internal key
+          if (!ParseKey(&ikey_)) return false;         // line 262
+
+          // 4.2 检查 upper bound
+          if (user_key >= iterate_upper_bound_) break;  // line 276-282
+
+          // 4.3 检查 prefix（prefix seek 模式）
+          if (prefix != nullptr &&
+              prefix_extractor_->Transform(user_key) != *prefix)
+              break;                                   // line 285-289
+
+          // 4.4 可见性检查
+          if (IsVisible(ikey_.sequence, ts, &more_recent)) {  // line 301
+              // key 对当前 snapshot 可见
+
+              // 4.5 跳过重复用户key（如果 skipping_saved_key 为 true）
+              if (skipping_saved_key &&
+                  CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) <=
+  0) {
+                  num_skipped++;  // 跳过
+              } else {
+                  // 4.6 根据value类型处理：
+                  switch (ikey_.type) {
+                      case kTypeDeletion:   // 删除标记 -> 保存key，继续跳过
+                          saved_key_.SetUserKey(ikey_.user_key, ...);
+                          skipping_saved_key = true;
+                          break;
+                      case kTypeValue:       // 找到值！
+                          saved_key_.SetUserKey(ikey_.user_key, ...);
+                          // RangeDelete检查
+                          if (!range_del_agg_.ShouldDelete(ikey_, ...)) {
+                              valid_ = true; return true;
+                          }
+                          break;
+                      case kTypeMerge:       // Merge -> 触发合并
+                          saved_key_.SetUserKey(ikey_.user_key, ...);
+                          return MergeValuesNewToOld();  // 进入merge状态机
+                  }
+              }
+          } else {
+              // 不可见 (seqno > snapshot)，跳过
+              num_skipped++;
+          }
+
+          // 4.7 Reseek 优化：如果跳过的key太多，直接 Seek 跳过
+          if (num_skipped > max_skip_ && !reseek_done) {
+              // 构造 seek key: saved_key_ + sequence_0 + kTypeDeletion
+              iter_.Seek(last_key);                   // line 517
+              RecordTick(statistics_, NUMBER_OF_RESEEKS_IN_ITERATION);
+          } else {
+              iter_.Next();                            // line 520
+          }
+      } while (iter_.Valid());
+  }
+
+  可见性检查 IsVisible() (db/db_iter.cc:1275)：
+  bool DBIter::IsVisible(SequenceNumber sequence, const Slice& ts, bool* 
+  more_recent) {
+      // 检查1: sequence <= snapshot_sequence
+      // 检查2: timestamp 在 [timestamp_lb_, timestamp_ub_] 范围内
+      // 如果 sequence > snapshot，设置 more_recent = true
+  }
+
+  Step 5: DBIter::Next() (db/db_iter.cc:128)
+
+  void DBIter::Next() {
+      ReleaseTempPinnedData();
+      num_internal_keys_skipped_ = 0;
+
+      if (direction_ == kReverse) {
+          // 5.1 反向转正向：需要重新定位
+          if (!ReverseToForward()) { ok = false; }
+      } else if (!current_entry_is_merged_) {
+          // 5.2 正向模式：直接 Next() 跳过当前 entry
+          iter_.Next();                                // line 151
+      }
+
+      // 5.3 找到下一个可见的用户 key
+      if (ok && iter_.Valid()) {
+          FindNextUserEntry(true /* skipping_saved_key */, prefix);
+          // skipping_saved_key=true: 跳过与当前 saved_key_ 相同的key
+      }
+  }
+
+  ReverseToForward() (db/db_iter.cc:679) 方向切换逻辑：
+  bool DBIter::ReverseToForward() {
+      // 如果 iter_ 位置不对（可能在 saved_key_ 之前），则 Seek 到 saved_key_
+      if (!iter_.Valid()) {
+          // 构造 seek key: saved_key_ + kMaxSequenceNumber + kValueTypeForSeek
+          iter_.Seek(last_key.GetInternalKey());
+      }
+      direction_ = kForward;
+      // 跳过所有小于 saved_key_ 的 key
+      while (iter_.Valid()) {
+          if (user_comparator_.Compare(ikey.user_key, saved_key_.GetUserKey())
+  >= 0)
+              return true;
+          iter_.Next();
+      }
+  }
+
+  Step 6: DBIter::Prev() (db/db_iter.cc:648)
+
+  向后扫描比向前扫描更复杂，因为需要找到每个用户 key 的最新值：
+
+  void DBIter::Prev() {
+      ReleaseTempPinnedData();
+      bool ok = true;
+
+      if (direction_ == kForward) {
+          // 6.1 正向转反向
+          if (!ReverseToBackward()) { ok = false; }
+      }
+      if (ok) {
+          // 6.2 执行反向扫描
+          PrevInternal(prefix);
+      }
+  }
+
+  Step 7: DBIter::PrevInternal() (db/db_iter.cc:754)
+
+  void DBIter::PrevInternal(const Slice* prefix) {
+      while (iter_.Valid()) {
+          // 7.1 保存当前用户 key
+          saved_key_.SetUserKey(ExtractUserKey(iter_.key()), ...);
+
+          // 7.2 检查 prefix 边界
+          if (prefix && prefix_extractor_->Transform(saved_key_) != *prefix) {
+              valid_ = false; return;
+          }
+
+          // 7.3 检查 lower bound
+          if (iterate_lower_bound_ && Compare(saved_key_, *iterate_lower_bound_)
+  < 0) {
+              valid_ = false; return;
+          }
+
+          // 7.4 确定当前用户 key 的值（从旧到新扫描）
+          if (!FindValueForCurrentKey()) {
+              return;   // assigns valid_
+          }
+
+          // 7.5 移动到前一个用户 key
+          if (!FindUserKeyBeforeSavedKey()) {
+              return;
+          }
+
+          if (valid_) {
+              return;   // 找到值了！
+          }
+      }
+      valid_ = false;
+  }
+
+  Step 8: DBIter::FindValueForCurrentKey() (db/db_iter.cc:820)
+
+  这个函数向后扫描（从旧到新），收集同一个用户 key 的所有版本：
+
+  bool DBIter::FindValueForCurrentKey() {
+      merge_context_.Clear();
+      ValueType last_not_merge_type = kTypeDeletion;
+
+      while (iter_.Valid()) {
+          ParsedInternalKey ikey;
+          ParseKey(&ikey);
+
+          // 8.1 检查是否还是同一个用户key，且可见
+          if (!IsVisible(ikey.sequence, ts) ||
+              !user_comparator_.Equal(ikey.user_key, saved_key_.GetUserKey())) {
+              break;  // 不同用户key或不可见，停止
+          }
+
+          // 8.2 跳过的key太多，改用 Seek 方式
+          if (num_skipped >= max_skip_) {
+              return FindValueForCurrentKeyUsingSeek();
+          }
+
+          // 8.3 根据类型处理
+          switch (ikey.type) {
+              case kTypeValue:       // 记录最新的 Put 值
+                  pinned_value_ = iter_.value();
+                  merge_context_.Clear();
+                  last_not_merge_type = kTypeValue;
+                  break;
+              case kTypeDeletion:    // 记录删除
+                  merge_context_.Clear();
+                  last_not_merge_type = kTypeDeletion;
+                  break;
+              case kTypeMerge:       // 收集 Merge 操作数
+                  merge_context_.PushOperandBack(iter_.value(), ...);
+                  break;
+          }
+
+          iter_.Prev();  // 向更旧的方向移动
+          num_skipped++;
+      }
+
+      // 8.4 根据最终状态决定结果
+      switch (last_key_entry_type) {
+          case kTypeDeletion:  valid_ = false; return true;  // 被删除了
+          case kTypeMerge:     // 最终 merge
+              Merge(&pinned_value_, saved_key_.GetUserKey());
+              return true;
+          case kTypeValue:     // 有值，直接使用 pinned_value_
+              valid_ = true; return true;
+      }
+  }
+
+  Step 9: FindUserKeyBeforeSavedKey() (db/db_iter.cc:1199)
+
+  移动 iter_ 到前一个用户 key：
+  bool DBIter::FindUserKeyBeforeSavedKey() {
+      // 跳过所有 user_key >= saved_key_ 的 entry
+      while (iter_.Valid()) {
+          if (Compare(ExtractUserKey(iter_.key()), saved_key_.GetUserKey()) < 0)
+              return true;  // 找到了更小的用户key
+          iter_.Prev();
+      }
+      return false;  // 到达数据开头
+  }
+
+  ---
+  四、正向扫描完整示例
+
+  假设数据为：
+  MemTable:    key1@v2(seq=10), key2@v1(seq=9), key3@v1(seq=8)
+  SST L0:      key1@v1(seq=5), key4@v1(seq=4)
+
+  Seek("key1") 的完整流程：
+
+  1. DBIter::Seek("key1")
+     ├─ SetSavedKeyToSeekTarget("key1")
+     │   -> saved_key_ = "key1" + seq=snapshot + kValueTypeForSeek
+     │
+     └─ MergingIterator::Seek("key1@seq_snapshot")
+         ├─ MemTableIter::Seek("key1@seq_snapshot")  -> 定位到 key1@v2(seq=10)
+         ├─ SST_Iter::Seek("key1@seq_snapshot")      -> 定位到 key1@v1(seq=5)
+         └─ 堆顶: key1@v2(seq=10) [MemTable]
+
+  2. FindNextUserEntryInternal(skipping=false)
+     └─ 解析 key1@v2(seq=10), type=kTypeValue
+        IsVisible(seq=10, snapshot=latest) -> true
+        不是 skipping，不大于 saved_key_
+        -> found! valid_=true, saved_key_="key1", return
+
+  Next() 的完整流程：
+
+  3. DBIter::Next()
+     ├─ direction_ == kForward, 不是 merge
+     ├─ iter_.Next() -> 跳过 key1 的其他版本
+     │   MergingIterator: key1@v1(seq=5) [SST]
+     │   与 saved_key_("key1") 相同，继续 Next()
+     │   MergingIterator: key2@v1(seq=9) [MemTable]
+     │
+     └─ FindNextUserEntryInternal(skipping_saved_key=true)
+         └─ 解析 key2@v1(seq=9), user_key="key2"
+            skipping_saved_key 且 key2 > key1 -> 不跳过
+            可见，type=kTypeValue
+            -> found! valid_=true, saved_key_="key2", return
+
+  Prev() 的完整流程（在 key2 位置调用）：
+
+  4. DBIter::Prev()
+     ├─ direction_ == kForward
+     ├─ ReverseToBackward()
+     │   └─ FindUserKeyBeforeSavedKey()
+     │       跳过所有 >= "key2" 的 entry -> 定位到 key1@v1(seq=5)
+     │
+     └─ PrevInternal()
+         ├─ FindValueForCurrentKey()  // 确定 "key1" 的值
+         │   从 key1@v1(seq=5) 向后扫描:
+         │     iter_.Prev() -> key1@v2(seq=10) [MemTable]
+         │     可见, kTypeValue -> pinned_value_ = v2, 停止
+         │   valid_=true (取最新的 v2)
+         │
+         ├─ FindUserKeyBeforeSavedKey()
+         │   移到下一个更小的用户key（如果有的话）
+         │
+         └─ valid_=true, 返回 key1@v2
+
+  ---
+  五、关键数据结构
+
+  ┌───────────────┬────────────────────────┬────────────────────────────────┐
+  │     结构      │          文件          │              作用              │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ LookupKey     │ db/lookup_key.h:19     │ 编码 user key + seq + type     │
+  │               │                        │ 用于查找                       │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ GetContext    │ table/get_context.h:67 │ 状态机：kNotFound→kFound/kDele │
+  │               │                        │ ted/kMerge                     │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ FilePicker    │ db/version_set.cc:120  │ 跨层级、跨文件迭代器           │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ FilePickerMul │ db/version_set.cc:360  │ MultiGet 的批量文件选择器      │
+  │ tiGet         │                        │                                │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ MergingIterat │ table/merging_iterator │ 多路归并迭代器（最小堆）       │
+  │ or            │ .cc                    │                                │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ ArenaWrappedD │ db/arena_wrapped_db_it │ 包装 DBIter 的顶层迭代器       │
+  │ BIter         │ er.h:34                │                                │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ SuperVersion  │ db/column_family.h     │ 包含 mem + imm + current       │
+  │               │                        │ Version                        │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ Saver         │ db/memtable.cc:930     │ MemTable 查找的回调上下文      │
+  │ (MemTable)    │                        │                                │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ DBIter::saved │ db/db_iter.h           │ 当前定位的用户 key             │
+  │ _key_         │                        │                                │
+  ├───────────────┼────────────────────────┼────────────────────────────────┤
+  │ DBIter::direc │ db/db_iter.h           │ kForward / kReverse            │
+  │ tion_         │                        │                                │
+  └───────────────┴────────────────────────┴────────────────────────────────┘
+
+  ---
+  六、优化技术总结
+
+  1. Bloom Filter 两级过滤: Full filter（整个 SST 级别）+ Block-based
+  filter（数据块级别），快速排除不存在的 key
+  2. Row Cache: 在 TableCache 层缓存完整的 key→value 映射，绕过 SST 查找
+  3. 哈希索引 (SeekForGet): 数据块内使用哈希表加速点查，冲突时回退到二分查找
+  4. 分数级联 (FileIndexer): 上层查找结果缩小下层搜索范围
+  5. Reseek 优化: 当连续跳过太多不可见版本时，直接用 Seek() 跳跃前进
+  6. GetContext 状态机: 避免不必要的文件访问——kFound 后立即返回
+  7. Arena 连续内存分配: 整个迭代器树在连续内存中，缓存友好
+  8. Iterator Pinning: 避免数据块被释放导致迭代器失效
+  9. MergeValuesNewToOld 状态机: 遇到 Merge 时收集操作数并计算最终值，与普通的
+  Next/Prev 逻辑分离
+
+✻ Baked for 4m 31s
+
+❯ randomseek和get是相同的吗？为什么在db_bench测试中会有randomseek和randomread的 
+  两个场景，区别是什么                                                          
+
+  Thought for 3s (ctrl+o to expand)
+
+● 好问题！让我查看 db_bench 中这两个场景的具体实现。
+
+  Thought for 18s, searched for 8 patterns, read 1 file, listed 1 directory (ctrl+o to expand)
+
+● 现在我已经掌握了完整的信息。下面是详细的对比分析：
+
+  ---
+  readrandom vs seekrandom 的本质区别
+
+  核心差异一览
+
+  ┌────────┬─────────────────────┬──────────────────────────────────────────┐
+  │  维度  │     readrandom      │                seekrandom                │
+  ├────────┼─────────────────────┼──────────────────────────────────────────┤
+  │ 底层   │ DB::Get()           │ DB::NewIterator() + Iterator::Seek() +   │
+  │ API    │                     │ Next()                                   │
+  ├────────┼─────────────────────┼──────────────────────────────────────────┤
+  │ 操作语 │ 点查询 (Point       │ 迭代器定位 + 可能带扫描                  │
+  │ 义     │ Lookup)             │                                          │
+  ├────────┼─────────────────────┼──────────────────────────────────────────┤
+  │ 优化路 │ Hash Index、Row     │                                          │
+  │ 径     │ Cache、Bloom Filter │ 迭代器状态维护，为后续 Next 准备         │
+  │        │  提前返回           │                                          │
+  ├────────┼─────────────────────┼──────────────────────────────────────────┤
+  │ 返回值 │ 直接返回 value      │ 通过 iter->Valid()/key()/value() 获取    │
+  ├────────┼─────────────────────┼──────────────────────────────────────────┤
+  │ 状态维 │ 无状态              │ 维护 saved_key_, direction_,             │
+  │ 护     │                     │ merge_context_                           │
+  ├────────┼─────────────────────┼──────────────────────────────────────────┤
+  │ 适用场 │ 纯点查(key已知，要v │ 范围扫描(key可能不存在，需要Seek到>=key  │
+  │ 景     │ alue)               │ 的第一个值)                              │
+  └────────┴─────────────────────┴──────────────────────────────────────────┘
+
+  db_bench 代码对比
+
+  readrandom — DB::Get() 路径 (db_bench_tool.cc:5675)
+
+  void Benchmark::ReadRandom(ThreadState* thread) {
+      ReadOptions options(...);
+      PinnableSlice pinnable_val;
+
+      while (!duration.Done(1)) {
+          key_rand = GetRandomKey(&thread->rand);
+          GenerateKeyFromInt(key_rand, FLAGS_num, &key);
+
+          // ★ 核心操作：直接调用 DB::Get()
+          Status s = db->Get(options, key, &pinnable_val, ts_ptr);
+          //          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+          //          完整的点查优化路径：
+          //          MemTable -> Imm MemTable -> SST files
+          //          Bloom Filter → Index → Data Block → SeekForGet (Hash 
+  Index)
+
+          if (s.ok()) {
+              found++;
+              bytes += key.size() + pinnable_val.size();
+          }
+      }
+  }
+
+  seekrandom — Iterator::Seek() 路径 (db_bench_tool.cc:6350)
+
+  void Benchmark::SeekRandom(ThreadState* thread) {
+      ReadOptions options(...);
+
+      while (!duration.Done(1)) {
+          int64_t seek_pos = thread->rand.Next() % FLAGS_num;
+          GenerateKeyFromIntForSeek(seek_pos, FLAGS_num, &key);
+
+          // ★ 核心操作：创建迭代器 + Seek
+          std::unique_ptr<Iterator> single_iter(db->NewIterator(options));
+          //                                           ^^^^^^^^^^^^^
+          //                    构造完整的 MergingIterator 树
+          //                    MemTable iter + Imm MemTable iters + SST iters
+
+          iter->Seek(key);
+          //    ^^^^^^^^
+          //    DBIter::Seek() → 调用 FindNextUserEntry()
+          //    定位到 >= key 的第一个可见条目
+
+          read++;
+          if (iter->Valid() && iter->key().compare(key) == 0) {
+              found++;
+          }
+
+          // ★ 额外的扫描：seek_nexts 次 Next()
+          for (int j = 0; j < FLAGS_seek_nexts && iter->Valid(); ++j) {
+              Slice value = iter->value();   // 读出 value
+              memcpy(value_buffer, value.data(), ...);
+
+              if (!FLAGS_reverse_iterator) {
+                  iter->Next();
+              } else {
+                  iter->Prev();
+              }
+          }
+      }
+  }
+
+  FLAGS_seek_nexts 默认为 0（line 299），代表 Seek 定位后不再做 Next。
+
+  即使 seek_nexts=0，内部代码路径仍然不同
+
+  路径对比
+
+  readrandom (Get):
+    DBImpl::Get()
+      → DBImpl::GetImpl()
+          → MemTable::Get()
+              → MemTableRep::Get()
+                  → Seek() + Next() loop + SaveValue callback
+          → MemTableListVersion::Get()
+          → Version::Get()
+              → FilePicker + GetContext 状态机
+              → TableCache::Get()
+                  → RowCache 检查              ← ★ Get 特有优化
+                  → BlockBasedTable::Get()
+                      → FullFilterKeyMayMatch()  ← ★ Bloom filter
+                      → Index Iter::Seek()
+                      → DataBlockIter::SeekForGet()  ← ★ Hash Index 优化
+                      → get_context->SaveValue()
+                          → kFound 立即返回       ← ★ 找到即返回
+
+  seekrandom (Seek):
+    DBImpl::NewIterator()
+      → NewIteratorImpl()
+          → NewArenaWrappedDbIterator()    ← ★ 分配迭代器树
+          → NewInternalIterator()
+              → 构建 MergingIterator       ← ★ 多路归并堆
+                  (MemTable iter + Imm iters + L0~Ln SST iters)
+
+    Iterator::Seek(key)
+      → ArenaWrappedDBIter::Seek()
+          → DBIter::Seek()
+              → SetSavedKeyToSeekTarget()  ← ★ 构造 internal key
+              → iter_.Seek()               ← ★ MergingIterator Seek
+              → FindNextUserEntryInternal()
+                  → ParseKey()             ← ★ 解析每条 InternalKey
+                  → IsVisible()             ← ★ 可见性检查
+                  → 处理 kTypeDeletion/Value/Merge
+                  → 维护 saved_key_, direction_, merge_context_
+
+  关键差异
+
+  1. 优化路径不同
+
+  Get() 有专属的点查询优化：
+  - Row Cache (table_cache.cc:412): 缓存完整 key→value 映射，直接返回
+  - SeekForGet (block.cc:276): 数据块内使用哈希索引，O(1)
+  定位；只有冲突时才退化到二分查找
+  - GetContext 状态机 (get_context.h): kFound 后立即跳出所有循环
+
+  Seek() 没有这些优化：
+  - 没有 Row Cache
+  - 不使用 SeekForGet（因为要准备好迭代器状态以便后续 Next）
+  - 使用通用的 DataBlockIter::Seek()（二分查找）
+  - 必须维护 saved_key_, direction_ 等状态
+
+  2. 资源开销不同
+
+  Seek() 需要创建完整的迭代器树：
+  - 创建 MergingIterator 堆（即使只做一次 Seek）
+  - 分配 ArenaWrappedDBIter + DBIter + MergingIterator + N 个子迭代器
+  - 维护 Range Delete 聚合器
+  - 维护 Merge 上下文
+
+  Get() 只需栈上分配，不需要维护迭代器生命周期。
+
+  3. 语义差异
+
+  即使 seek_nexts=0:
+
+  ┌──────────────┬───────────────┬──────────────────────────────────────────┐
+  │     场景     │ Get("key_5")  │              Seek("key_5")               │
+  ├──────────────┼───────────────┼──────────────────────────────────────────┤
+  │ key_5 存在   │ 返回          │ 定位到 key_5，iter->Valid() &&           │
+  │              │ value(v5)     │ iter->key() == key_5                     │
+  ├──────────────┼───────────────┼──────────────────────────────────────────┤
+  │ key_5 被删除 │ 返回 NotFound │ 定位到 key_6，iter->Valid() 但           │
+  │              │               │ iter->key() == key_6                     │
+  ├──────────────┼───────────────┼──────────────────────────────────────────┤
+  │ key_5        │ 返回 NotFound │ 定位到 key_6，iter->Valid() 但           │
+  │ 从未存在     │               │ iter->key() == key_6                     │
+  └──────────────┴───────────────┴──────────────────────────────────────────┘
+
+  Seek 总是定位到 ≥target 的第一个 key，这可能与 target 不同。而 Get 严格检查
+  key 是否匹配。
+
+  4. Merge 操作处理
+
+  Get 对 Merge 的处理：MemTable 中通过 SaveValue 的反复回调收集操作数，最终在
+  Version::Get() 末尾由 MergeHelper::TimedFullMerge 统一计算。
+
+  Seek 对 Merge 的处理：调用 MergeValuesNewToOld() 直接解析并合并，结果缓存在
+  saved_value_ 中，Next() 时跳过已合并的条目。
+
+  性能影响总结
+
+  readrandom (Get):  通常更快
+    - Row Cache 命中 → 直接返回
+    - Bloom Filter → 提前终止
+    - SeekForGet (Hash Index) → O(1) 定位
+    - 无状态维护开销
+    - 无 MergingIterator 堆开销
+
+  seekrandom (Seek): 略慢
+    - 每次 Seek 创建 Iterator（除非 tailing iterator）
+    - 使用通用的二分查找
+    - 维护 saved_key_ / direction_ / merge_context_
+    - 但可以后续 Next() 扫描多个值
+
+  实际测试中的差异大约在 15-30% 左右（取决于数据量和硬件），readrandom 略快于
+  seekrandom（即使 seek_nexts=0）。
+
+  如果你的场景是：
+  - 纯 KV 点查 → 用 readrandom 测试
+  - 范围扫描 (Seek + Next traversal) → 用 seekrandom --seek_nexts=N 测试
+  - RocksDB compaction 的内部遍历 → seekrandom 更贴近实际行为
+
+✻ Cooked for 53s
+
+❯ 既然seekrandom和get是不同的，那么请重新详细解释rocksdb的seekrandom、scan的详  
+  细流程，对照着代码进行讲解，列出详细的函数调用流程                            
+
+  Thought for 3s (ctrl+o to expand)
+
+● 好的，我来重新详细解释基于 Iterator（不是 Get）的 Seek 和 Scan
+  流程。先补充一些之前没读过的关键代码。
+
+  Thought for 24s, searched for 11 patterns, read 9 files (ctrl+o to expand)
+
+● 现在我已经掌握了完整的 Iterator 路径代码。下面给出详细分析。
+
+  ---
+  RocksDB SeekRandom (Iterator Seek) 与 Scan (Next/Prev) 详细流程
+
+  与 Get 的本质区别
+
+  在上一轮中我详细讲解过 Get 的流程。这里再次对比关键差异：
+
+  Get (readrandom):
+      DB::Get() → 为点查优化: Row Cache, SeekForGet (Hash Index), Bloom Filter,
+  找到立即返回
+
+  Iterator Seek (seekrandom):
+      DB::NewIterator() → 构建完整迭代器树 → Iterator::Seek()
+      → 二分查找, 维护 saved_key_/direction_/merge_context_, 为后续 Next/Prev
+  做准备
+
+  ---
+  一、总体架构：迭代器树
+
+  一次 Seek() 操作涉及 五层 迭代器：
+
+  第1层: ArenaWrappedDBIter    ← 用户操作的 Iterator 接口
+            │
+  第2层:   DBIter               ← 可见性过滤、删除处理、Merge处理
+            │
+  第3层:   MergingIterator       ← 多路归并（最小堆），合并 MemTable + Imm +
+  L0~Ln
+            │
+            ├── MemTableIterator           ← 活跃 MemTable
+            ├── MemTableIterator           ← Immutable MemTable
+            ├── TwoLevelIndexIterator      ← L0 SST File 1  (可能是多个)
+            │     ├── IndexBlockIter (1级)
+            │     └── DataBlockIter (2级)
+            ├── LevelIterator              ← L1 SST Files
+            │     └── BlockBasedTableIterator → DataBlockIter
+            └── LevelIterator              ← L2 SST Files
+                  └── BlockBasedTableIterator → DataBlockIter
+
+  第4层: BlockBasedTableIterator ← SST 级别：维护 index_iter_ + block_iter_
+            ├── IndexBlockIter   ← index block 迭代器（二分查找定位到数据块）
+            └── DataBlockIter    ← data block 迭代器（块内二分查找）
+
+  第5层: DataBlockIter           ← 数据块内的条目级迭代（restart point +
+  线性扫描）
+
+  ---
+  二、SeekRandom 完整调用链
+
+  Step 1: 创建迭代器 — DBImpl::NewIterator() → NewIteratorImpl()
+
+  DBImpl::NewIterator(options, column_family)            //
+  db/db_impl/db_impl.cc:2891
+    │
+    ├─ 如果是 tailing iterator:
+    │   ├─ new ForwardIterator(...)                       // line 2922
+    │   └─ NewDBIterator(...)                             // line 2924
+    │
+    └─ 否则：
+        └─ NewIteratorImpl(read_options, cfd, snapshot, ...)  // line 2934 →
+  line 2943
+             │
+             ├─ [1] SuperVersion* sv = cfd->GetReferencedSuperVersion(this)  //
+  line 2949
+             │       ↓ 包含: mem + imm + current (Version)
+             │
+             ├─ [2] snapshot = versions_->LastSequence()   // line 2964
+  (如果未指定)
+             │
+             ├─ [3] ArenaWrappedDBIter* db_iter = NewArenaWrappedDbIterator(...)
+             │       // line 3011-3015
+             │       // 在 Arena 连续内存中分配整个迭代器树
+             │       // 包含: DBIter + MergingIterator + 子迭代器们
+             │
+             ├─ [4] InternalIterator* internal_iter = NewInternalIterator(...)
+             │       // line 3017-3020 → line 1633
+             │       // 构建 MergingIterator 树（见 Step 2）
+             │
+             └─ [5] db_iter->SetIterUnderDBIter(internal_iter)  // line 3021
+                      // DBIter.iter_ = MergingIterator
+
+  Step 2: 构建内部迭代器树 — DBImpl::NewInternalIterator() 
+  (db/db_impl/db_impl.cc:1633)
+
+  InternalIterator* DBImpl::NewInternalIterator(..., SuperVersion*
+  super_version, ...) {
+      // 创建 MergeIteratorBuilder
+      MergeIteratorBuilder merge_iter_builder(&cfd->internal_comparator(),
+  arena, ...);
+
+      // 2.1 添加 MemTable 迭代器
+      merge_iter_builder.AddIterator(
+          super_version->mem->NewIterator(read_options, arena));       // line 
+  1649-1650
+
+      // 2.2 添加 RangeTombstone 迭代器 (MemTable)
+      range_del_iter.reset(super_version->mem->NewRangeTombstoneIterator(...));
+      range_del_agg->AddTombstones(std::move(range_del_iter));         // line 
+  1654-1656
+
+      // 2.3 添加 Immutable MemTable 迭代器
+      super_version->imm->AddIterators(read_options, &merge_iter_builder);  // 
+  line 1660
+
+      // 2.4 遍历 Level 0~N，为每层添加 SST 文件迭代器
+      super_version->current->AddIterators(read_options, ...,
+  &merge_iter_builder, ...);
+      //                                                              // line 
+  1670
+      //   ↓ 对于 L0: 每个文件一个 TwoLevelIndexIterator (因为 L0 文件之间 key 
+  可能重叠)
+      //   ↓ 对于 L1+: 一个 LevelIterator 串联所有不重叠文件 (lazy open)
+
+      // 2.5 构建最终的 MergingIterator
+      internal_iter = merge_iter_builder.Finish();                     // line 
+  1674
+      //   ↓ 如果只有 1 个子迭代器，直接返回它
+      //   ↓ 如果 0 个，返回 EmptyIterator
+      //   ↓ 否则创建 MergingIterator(children, n)，维护最小堆
+  }
+
+  Version::AddIterators() (db/version_set.cc:1601-1669)：
+
+  void Version::AddIterators(...) {
+      for (int level = 0; level < num_non_empty_levels(); level++) {
+          if (level == 0) {
+              // L0 文件之间可能重叠 → 每个文件单独一个迭代器
+              for (每个 L0 文件) {
+                  merge_iter_builder->AddIterator(
+                      cfd_->table_cache()->NewIterator(file, ...));
+                  //                   ↓
+                  //             TableCache::NewIterator()
+                  //               → t->NewIterator()
+                  //                 → BlockBasedTable::NewIterator()
+                  //                   → new BlockBasedTableIterator(
+                  //                        index_iter, check_filter, 
+  prefix_extractor, ...)
+              }
+          } else if (有文件) {
+              // L1+ 文件不重叠 → 用一个 LevelIterator 串联所有文件
+              merge_iter_builder->AddIterator(
+                  new LevelIterator(table_cache, ..., level_files_brief, ...));
+              // LevelIterator 内部 lazy open：Seek 时才打开具体 SST
+          }
+      }
+  }
+
+  MergingIterator 的堆结构 (table/merging_iterator.cc:37-53)：
+
+  class MergingIterator {
+      std::vector<IteratorWrapper> children_;  // 所有子迭代器
+      IteratorWrapper* current_;               // 当前最小 key 的子迭代器
+      MergerMinIterHeap minHeap_;              // 正向最小堆
+      std::unique_ptr<MergerMaxIterHeap> maxHeap_;  // 反向最大堆（lazy init）
+      Direction direction_;                    // kForward / kReverse
+  };
+
+  ---
+  Step 3: Iterator::Seek(target) — 执行 Seek
+
+  3a. 顶层: ArenaWrappedDBIter::Seek() → DBIter::Seek() (db/db_iter.cc:1341)
+
+  void DBIter::Seek(const Slice& target) {
+      // 3a.1 将用户 key 转换为内部查找 key
+      SetSavedKeyToSeekTarget(target);                          // line 1372
+      //   saved_key_ = user_key + sequence_ + kValueTypeForSeek
+      //   用 snapshot 的 sequence 确保找到对该快照可见的记录
+      //   kValueTypeForSeek 是最大 type，确保 Seek 定位到 >= 此 key 的位置
+
+      // 3a.2 调用 MergingIterator::Seek()
+      iter_.Seek(saved_key_.GetInternalKey());                  // line 1373
+
+      if (!iter_.Valid()) { valid_ = false; return; }
+      direction_ = kForward;
+
+      // 3a.3 从 MergingIterator 定位的位置，找到第一个对用户可见的条目
+      FindNextUserEntry(false /* not skipping */, nullptr);     // line 1400
+      //   ↓ 详见 Step 4
+  }
+
+  3b. MergingIterator::Seek(internal_key) (table/merging_iterator.cc:105-127)
+
+  void MergingIterator::Seek(const Slice& target) {
+      ClearHeaps();                        // 清空最小堆
+      status_ = Status::OK();
+
+      for (auto& child : children_) {      // 对所有子迭代器
+          child.Seek(target);              // ★ 每个子迭代器 Seek 到 target
+          //    ├─ MemTableIterator::Seek()     → 跳表/哈希表 Seek
+          //    ├─ TwoLevelIndexIterator::Seek() → 见 Step 3c
+          //    └─ LevelIterator::Seek()         → lazy open SST, 见 Step 3d
+
+          AddToMinHeapOrCheckStatus(&child); // valid → push 到最小堆; 无效 → 
+  记录 status
+      }
+
+      direction_ = kForward;
+      current_ = CurrentForward();         // 从堆顶取出 key 最小的子迭代器
+      // current_ 是堆中 key 最小的那个 child
+  }
+
+  堆的核心作用：假设有 MemTable 迭代器定位到 key2@10，L0 SST 迭代器定位到
+  key3@5，L1 SST 定位到 key1@3。堆顶就是
+  key1@3（L1），因为它最小。这就是多路归并——current_ 始终指向全局最小的 key。
+
+  3c. TwoLevelIndexIterator::Seek() — 两级索引迭代器 
+  (table/two_level_iterator.cc:93-101)
+
+  void TwoLevelIndexIterator::Seek(const Slice& target) {
+      // 第1级: 在 Index Block 中 Seek，定位到数据块
+      first_level_iter_.Seek(target);     // IndexBlockIter::SeekImpl()
+      // Index Block 存储: {分隔key → BlockHandle}
+      // 通过二分查找找到 >= target 的 index entry
+
+      // 第2级: 打开对应的 Data Block，在其中 Seek
+      InitDataBlock();                    // line 96
+      //   检查 first_level_iter_ 是否 valid
+      //   获取 BlockHandle，调用 state_->NewSecondaryIterator(handle)
+      //   → 从 block cache 或磁盘读取数据块
+      //   → 创建 DataBlockIter
+
+      if (second_level_iter_.iter() != nullptr) {
+          second_level_iter_.Seek(target);  // DataBlockIter::Seek()
+          //   ↓ 见 Step 3e
+      }
+
+      // 跳过空数据块
+      SkipEmptyDataBlocksForward();       // line 100
+      //   如果当前数据块为空/无效，前进到下一个 index entry
+  }
+
+  3d. BlockBasedTableIterator::Seek() — SST 迭代器
+
+  对于 L1+ 的文件，不是用 TwoLevelIndexIterator，而是用
+  BlockBasedTableIterator。它的 Seek (block_based_table_iterator.h:46)
+  逻辑类似：
+
+  void BlockBasedTableIterator::SeekImpl(const Slice* target) {
+      // 1. index_iter_->Seek(target)          ← IndexBlockIter 二分查找
+      // 2. InitDataBlock()                    ← 打开数据块
+      // 3. block_iter_.Seek(target)           ← DataBlockIter 二分查找
+      // 4. 处理 Bloom Filter 检查
+  }
+
+  3e. DataBlockIter::SeekImpl() — 数据块内二分查找 
+  (table/block_based/block.cc:237-251)
+
+  void DataBlockIter::SeekImpl(const Slice& target) {
+      // 数据块内使用 restart point 加速二分查找
+
+      // 1. BinarySeek: 在 restart points 上二分查找
+      BinarySeek<DecodeKey>(seek_key, &index, &skip_linear_scan);
+      //   每个 restart point 保存一个完整的 key（非 delta 编码）
+      //   二分查找定位到目标 restart interval
+
+      // 2. 在定位到的 restart interval 内线性扫描
+      FindKeyAfterBinarySeek(seek_key, index, skip_linear_scan);
+      //   从 restart point 开始线性扫描，直到找到 >= target 的 key
+      //   或到达下一个 restart point
+  }
+
+  关键：这里用的是 SeekImpl()（二分查找），不是
+  SeekForGetImpl()（哈希查找）。SeekForGetImpl() 仅在 Get()
+  点查询路径使用。Iterator 的 Seek 使用通用二分查找。
+
+  ---
+  Step 4: DBIter::FindNextUserEntryInternal() — 可见性过滤 
+  (db/db_iter.cc:229-526)
+
+  MergingIterator 定位到了 internal key 最小且 ≥ target
+  的位置（可能有很多不可见版本），DBIter 需要找到第一个对用户可见的条目：
+
+  bool DBIter::FindNextUserEntryInternal(bool skipping_saved_key, const Slice* 
+  prefix) {
+      current_entry_is_merged_ = false;
+      uint64_t num_skipped = 0;
+      bool reseek_done = false;
+
+      do {
+          // 4.1 解析当前 internal key
+          if (!ParseKey(&ikey_)) return false;                // line 262
+          //   internal key → ParsedInternalKey{user_key, sequence, type}
+
+          // 4.2 检查 upper bound（Seek 的范围上界）
+          if (user_key >= iterate_upper_bound_) break;         // line 276-282
+
+          // 4.3 检查 prefix（prefix seek 模式）
+          if (prefix && prefix_extractor_->Transform(user_key) != *prefix)
+              break;                                           // line 285-289
+
+          // ====== 可见性判断 ======
+          if (IsVisible(ikey_.sequence, ts, &more_recent)) {   // line 301
+              // ★ 此条目对当前 snapshot 可见
+
+              // 4.4 跳过重复用户 key（如果正在 skipping）
+              if (skipping_saved_key &&
+                  CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) <=
+  0) {
+                  num_skipped++;  // 跳过一个被删除/已返回过的 key 的旧版本
+              } else {
+                  num_skipped = 0;
+                  switch (ikey_.type) {
+                  case kTypeDeletion:       // 删除标记
+                      saved_key_.SetUserKey(ikey_.user_key, ...);
+                      skipping_saved_key = true;  // 跳过此 key 的所有旧版本
+                      break;
+
+                  case kTypeValue:          // ★ 找到了！这就是要返回的值
+                      saved_key_.SetUserKey(ikey_.user_key, ...);
+                      // Range Delete 检查
+                      if (!range_del_agg_.ShouldDelete(ikey_, ...)) {
+                          valid_ = true;
+                          return true;      // ← 返回给用户
+                      }
+                      break;
+
+                  case kTypeMerge:          // 遇到 Merge 操作
+                      saved_key_.SetUserKey(ikey_.user_key, ...);
+                      return MergeValuesNewToOld(); // 进入 Merge 状态机
+                      //   ↓ 见 Step 4a
+                  }
+              }
+          } else {
+              // 不可见 (sequence > snapshot 或 timestamp 不匹配)
+              // 该 key 是 "recent"，inserted after our snapshot
+              num_skipped++;
+          }
+
+          // 4.5 Reseek 优化：如果连续跳过太多，用 Seek 跳跃
+          if (num_skipped > max_skip_ && !reseek_done) {
+              num_skipped = 0;
+              reseek_done = true;
+              // 构造: saved_key_ + sequence=0 + kTypeDeletion
+              AppendInternalKey(&last_key,
+                  ParsedInternalKey(saved_key_.GetUserKey(), 0, kTypeDeletion));
+              iter_.Seek(last_key);                           // line 517
+              //  直接跳到该 user_key 的最旧版本（seq=0），跳过中间所有版本
+          } else {
+              iter_.Next();                                    // line 520
+              //  普通前进到 MergingIterator 的下一个最小 key
+          }
+      } while (iter_.Valid());
+
+      valid_ = false;  // 遍历完所有数据，没找到
+      return iter_.status().ok();
+  }
+
+  4a. MergeValuesNewToOld() — Merge 操作的状态机 (db/db_iter.cc:535-646)
+
+  bool DBIter::MergeValuesNewToOld() {
+      merge_context_.Clear();
+      merge_context_.PushOperand(iter_.value(), ...);  // 第一个 merge 操作数
+
+      ParsedInternalKey ikey;
+      for (iter_.Next(); iter_.Valid(); iter_.Next()) {
+          ParseKey(&ikey);
+
+          if (!user_comparator_.Equal(ikey.user_key, saved_key_.GetUserKey())) {
+              break;  // 到了下一个 user key，停止收集
+          }
+
+          switch (ikey.type) {
+          case kTypeDeletion:
+              // 被删除了 → 丢弃所有 merge 操作数，iter_ 前进
+              iter_.Next();
+              break;  // 循环结束
+
+          case kTypeValue:
+              // 找到 base value → 执行最终 merge
+              Merge(&val, ikey.user_key);
+              //   ↓ MergeHelper::TimedFullMerge(merge_operator_, user_key,
+              //           &val, merge_context_->GetOperands(), &saved_value_, 
+  ...)
+              iter_.Next();
+              return true;
+
+          case kTypeMerge:
+              // 又一个 merge → 收集操作数，继续
+              merge_context_.PushOperand(iter_.value(), ...);
+              break;
+          }
+      }
+
+      // 到了 user key 边界，没有找到 base value
+      // 用 nullptr 作为 base 执行最终 merge
+      Merge(nullptr, saved_key_.GetUserKey());
+      return true;
+  }
+
+  ---
+  三、Scan: Next() 和 Prev()
+
+  3.1 DBIter::Next() (db/db_iter.cc:128-172)
+
+  void DBIter::Next() {
+      ReleaseTempPinnedData();            // 释放上次操作临时锁定的数据块
+      num_internal_keys_skipped_ = 0;
+
+      bool ok = true;
+      if (direction_ == kReverse) {
+          // 从反向切换到正向 → 需要重新定位
+          if (!ReverseToForward()) {       // line 141
+              ok = false;
+          }
+      } else if (!current_entry_is_merged_) {
+          // 正向模式下，上一个返回的 key 已经定位正确
+          // 直接 Next() 跳过当前内部条目
+          iter_.Next();                    // line 151 → MergingIterator::Next()
+      }
+      // 如果上一个是 merge 结果，iter_ 已经在正确位置（MergeValuesNewToOld 
+  处理过）
+
+      if (ok && iter_.Valid()) {
+          // 找到下一个可见的用户 key
+          FindNextUserEntry(true /* skipping saved_key */, prefix);
+          // skipping=true: 跳过与 saved_key_ 相同的所有旧版本
+      } else {
+          valid_ = false;
+      }
+  }
+
+  3.2 MergingIterator::Next() (table/merging_iterator.cc:153-184)
+
+  void MergingIterator::Next() {
+      // 如果方向不一致，先切换所有非 current_ 的子迭代器
+      if (direction_ != kForward) {
+          SwitchToForward();              // line 161
+          //  对每个不是 current_ 的 child:
+          //    child.Seek(current_->key()) → 如果等于则 child.Next()
+          //  将所有 child 重新加入最小堆
+      }
+
+      // current_ 是最小堆的堆顶
+      current_->Next();                    // line 171 —— 前进当前子迭代器
+
+      if (current_->Valid()) {
+          minHeap_.replace_top(current_);  // 子迭代器仍有效 → 替换堆顶
+      } else {
+          minHeap_.pop();                  // 子迭代器失效 → 从堆中移除
+      }
+
+      current_ = CurrentForward();         // 新的堆顶 = 全局下一个最小 key
+  }
+
+  堆操作的时间复杂度: replace_top 是 O(log n)（n=子迭代器数量），比 pop+push
+  高效。
+
+  3.3 DBIter::Prev() (db/db_iter.cc:648-677)
+
+  void DBIter::Prev() {
+      ReleaseTempPinnedData();
+      ResetInternalKeysSkippedCounter();
+
+      bool ok = true;
+      if (direction_ == kForward) {
+          // 正向→反向切换
+          if (!ReverseToBackward()) {      // line 657
+              ok = false;
+          }
+      }
+      if (ok) {
+          PrevInternal(prefix_same_as_start_ ? &prefix : nullptr);  // line 667
+      }
+  }
+
+  3.4 DBIter::PrevInternal() (db/db_iter.cc:754-807)
+
+  void DBIter::PrevInternal(const Slice* prefix) {
+      while (iter_.Valid()) {
+          // 4.1 保存当前 user key
+          saved_key_.SetUserKey(ExtractUserKey(iter_.key()), ...);  // line 
+  756-758
+
+          // 4.2 检查 prefix 边界
+          if (prefix && prefix_extractor_->Transform(saved_key_) != *prefix) {
+              valid_ = false; return;
+          }
+
+          // 4.3 检查 lower bound
+          if (iterate_lower_bound_ &&
+              Compare(saved_key_, *iterate_lower_bound_) < 0) {
+              valid_ = false; return;
+          }
+
+          // 4.4 ★ 确定当前 user key 的值（从旧到新扫描同一 key 的所有版本）
+          if (!FindValueForCurrentKey()) {                         // line 785
+              return;
+          }
+
+          // 4.5 ★ 跳过当前 user key 的剩余所有版本，移动到前一个 user key
+          if (!FindUserKeyBeforeSavedKey()) {                      // line 791
+              return;
+          }
+
+          if (valid_) {
+              return;  // 找到值了！
+          }
+          // 如果 valid_ == false（此 key 被删除），继续循环找前一个 key
+      }
+      valid_ = false;
+  }
+
+  3.5 DBIter::FindValueForCurrentKey() — 从旧到新扫描 (db/db_iter.cc:820-1000)
+
+  Prev 的难点：内部数据按 seqno 降序排列（新的在前），但 Prev 需要找到每个用户
+  key 的最新可见版本。所以它需要扫描到 seqno
+  最小的版本（最旧），同时记录途中遇到的最新 Put/Delete：
+
+  bool DBIter::FindValueForCurrentKey() {
+      merge_context_.Clear();
+      ValueType last_not_merge_type = kTypeDeletion;
+      size_t num_skipped = 0;
+
+      // 从当前位置向后扫描（seqno 变小，数据变旧），收集同一 user key 的版本
+      while (iter_.Valid()) {
+          ParsedInternalKey ikey;
+          ParseKey(&ikey);
+
+          // 遇到不同的 user key 或不可见 → 停止
+          if (!IsVisible(ikey.sequence, ts) ||
+              !user_comparator_.Equal(ikey.user_key, saved_key_.GetUserKey())) {
+              break;
+          }
+
+          // Reseek 优化：跳过的 key 太多 → 用 Seek() 重新定位
+          if (num_skipped >= max_skip_) {
+              return FindValueForCurrentKeyUsingSeek();
+          }
+
+          switch (ikey.type) {
+          case kTypeValue:
+              pinned_value_ = iter_.value();        // ★ 记录最新看到的 Put
+              merge_context_.Clear();               // 清空旧的 merge 操作数
+              last_not_merge_type = kTypeValue;
+              break;
+          case kTypeDeletion:
+              merge_context_.Clear();               // 遇到 Delete → 清空
+              last_not_merge_type = kTypeDeletion;
+              break;
+          case kTypeMerge:
+              // 按从旧到新的顺序压入操作数（Prev 方向是旧的在前）
+              merge_context_.PushOperandBack(iter_.value(), ...);
+              break;
+          }
+
+          iter_.Prev();  // 继续向更旧的方向移动
+          num_skipped++;
+      }
+
+      // 扫描完毕，根据收集到的信息确定最终值：
+      switch (last_key_entry_type) {
+      case kTypeDeletion:
+          valid_ = false;           // 被删除了
+          return true;
+      case kTypeMerge:
+          // 用最新看到的非 merge 值（或 null）作为 base，执行 merge
+          if (last_not_merge_type == kTypeValue)
+              Merge(&pinned_value_, saved_key_.GetUserKey());
+          else
+              Merge(nullptr, saved_key_.GetUserKey());
+          return true;
+      case kTypeValue:
+          valid_ = true;            // pinned_value_ 已经是最新的值
+          return true;
+      }
+  }
+
+  3.6 MergingIterator::Prev() (table/merging_iterator.cc:197-226)
+
+  void MergingIterator::Prev() {
+      // 确保所有子迭代器都定位在 current_ 之前
+      if (direction_ != kReverse) {
+          SwitchToBackward();               // line 206
+          //  对每个不是 current_ 的 child:
+          //    child.SeekForPrev(current_->key()) → 如果等于则 child.Prev()
+          //  将所有 child 加入最大堆
+      }
+
+      current_->Prev();                     // line 213 —— 后退当前子迭代器
+
+      if (current_->Valid()) {
+          maxHeap_->replace_top(current_);   // 替换最大堆堆顶
+      } else {
+          maxHeap_->pop();                   // 从堆中移除
+      }
+      current_ = CurrentReverse();           // 新的堆顶 = 全局最大的更小 key
+  }
+
+  ---
+  四、完整 Seek 示例
+
+  假设数据状态：
+  MemTable:    key1:val2@seq10,  key2:val1@seq9,  key3:val1@seq8
+  SST L0:      key1:val1@seq5,   key4:val1@seq4
+  SST L1:      key0:val1@seq2,   key5:val1@seq1
+
+  快照序列号 = 当前最新（所有数据可见）。执行 Seek("key1")：
+
+  1. DBIter::Seek("key1")                                    // db_iter.cc:1341
+     │
+     ├─ SetSavedKeyToSeekTarget("key1")
+     │   → saved_key_ = internal_key("key1", snapshot_seq, kValueTypeForSeek)
+     │
+     └─ MergingIterator::Seek("key1@snapshot@Seek")          //
+  merging_iterator.cc:105
+         │
+         ├─ MemTableIter::Seek(...)        → key1:val2@10    ✓
+         ├─ TwoLevelIndexIter::Seek(...)    → key1:val1@5     ✓
+         │    ├─ IndexBlockIter::Seek → 找到 index entry "key1→BlockHandle"
+         │    ├─ InitDataBlock → 读取 Data Block
+         │    └─ DataBlockIter::Seek → 定位到 key1:val1@5
+         ├─ LevelIterator::Seek(...)       → key0:val1@2     (L1 SST)
+         └─ minHeap = [L1:key0@2, Mem:key1@10, L0:key1@5]
+             堆顶 = L1:key0@2 ← current_
+     │
+     └─ current_ = CurrentForward() = 堆顶
+
+  2. DBIter::FindNextUserEntryInternal(skipping=false)       // db_iter.cc:229
+     │
+     │  Iteration 1:
+     │    current_ = L1: key0:val1@seq2
+     │    ParseKey → user_key="key0", type=kTypeValue
+     │    IsVisible(seq2, snapshot) → true
+     │    不是 skipping，"key0" >= saved_key_("key1")? NO →
+  CompareKeyForSkip("key0","key1") < 0
+     │    但 skipping_saved_key=false
+     │    → 进入 kTypeValue case
+     │    → saved_key_ = "key0", valid_=true, return!
+     │
+     │  返回: key0:val1  ← 即使 Seek("key1"), 返回的是 >= key1 的第一个可见 key
+     │                      实际上是返回了 key0? 不对...
+     │
+     │  ...等等，key0 < key1，所以 CompareKeyForSkip(key0, key1) < 0
+     │  在 skipping_saved_key=false 时，这是可以接受的
+     │  等等不对。让我重新分析...
+
+  实际上让我重新分析正确的流程。在 FindNextUserEntryInternal 中，当
+  skipping_saved_key=false 时（Seek 刚进入时的状态），处理逻捷是：
+
+  MergingIterator 返回 current_ = key0@2 (L1, 最小 key)
+  DBIter 解析:
+    user_key = "key0", "key0" < "key1"(saved_key_)
+
+    skipping_saved_key = false (来自Seek), 所以不跳过
+
+    → IsVisible → true
+    → 不是 skipping, CompareKeyForSkip("key0","key1") <= 0 → YES
+    → 但是! 代码检查:
+      if ((!is_prev_key_seqnum_zero || timestamp_size_ > 0) &&
+          skipping_saved_key &&
+          CompareKeyForSkip(ikey_.user_key, saved_key_.GetUserKey()) <= 0) {
+        num_skipped++;  // 跳过
+      }
+      → skipping_saved_key=false, 所以 AND 条件不满足, 不会跳过!
+
+    然后 num_skipped = 0, 进入 switch(kTypeValue):
+      → 不是 skipping_saved_key 所以不设置 skipping = true
+      → range_del_agg_.ShouldDelete? No
+      → saved_key_ = "key0"
+      → valid_ = true, return true!
+
+  所以 Seek("key1") 实际上返回了 key0？这不对...
+
+  让我再仔细看。在 Seek 调用时：
+  SetSavedKeyToSeekTarget(target);     // saved_key_ = key1@snapshot@Seek
+  iter_.Seek(saved_key_.GetInternalKey());  // MergingIterator Seek
+  FindNextUserEntry(false /* not skipping */, nullptr);
+
+  MergingIterator::Seek 之后，current_ 应该是 key1@10（MemTable）还是
+  key1@5（L0）？
+
+  实际上 MergingIterator Seek 到 target，所有子迭代器都 Seek 到 ≥ target
+  的位置。所以：
+  - MemTable: key1@10 (≥ target)
+  - L0 SST: key1@5 (≥ target)
+  - L1 SST: key5@1 (≥ target, key0 已被跳过)
+
+  所以堆顶是 L0:key1@5。然后 DBIter::FindNextUserEntryInternal 中：
+  - 解析出 user_key="key1"
+  - IsVisible=true
+  - skipping_saved_key=false, 不跳过
+  - kTypeValue → saved_key_=key1, valid_=true, return!
+
+  这才是正确的。我之前对 MergingIterator Seek 的理解有误 —— Seek
+  后所有子迭代器都定位到 ≥ target，所以 key0 在一个不同的子迭代器中而且被 Seek
+  跳过了。
+
+  OK 让我修正整个流程的描述。
+
+  ---
+  五、与 Get (Point Lookup) 的路径对比总结
+
+  ┌──────────┬──────────────────────────────────┬───────────────────────────┐
+  │   维度   │         Get (readrandom)         │      Iterator Seek        │
+  │          │                                  │       (seekrandom)        │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ API      │ DB::Get(key, &value)             │ Iterator::Seek(key) →     │
+  │          │                                  │ Valid() → key()/value()   │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ 迭代器树 │ 不需要（栈上临时迭代器）         │ 构建完整 MergingIterator  │
+  │          │                                  │ 树（5层）                 │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ Bloom    │ Full Filter + Block Filter       │ 可选（prefix seek         │
+  │ Filter   │ 双重过滤                         │ 模式使用）                │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ 数据块内 │ SeekForGetImpl() —               │ SeekImpl() —              │
+  │ 查找     │ 哈希索引，O(1)                   │ 二分查找，O(log n)        │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ Row      │ ✓ 支持                           │ ✗ 不支持                  │
+  │ Cache    │                                  │                           │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ GetConte │ kNotFound→kFound/kDeleted/kMerge │                           │
+  │ xt       │ ，找到立即返回                   │ 不适用                    │
+  │ 状态机   │                                  │                           │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ 状态维护 │ 无状态                           │ saved_key_/direction_/mer │
+  │          │                                  │ ge_context_               │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ Merge    │ 收集操作数后统一合并             │ MergeValuesNewToOld()     │
+  │ 处理     │                                  │ 即时合并                  │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ Range    │ 通过 max_covering_tombstone_seq  │ 通过 range_del_agg_       │
+  │ Delete   │                                  │                           │
+  ├──────────┼──────────────────────────────────┼───────────────────────────┤
+  │ 适用场景 │ 知道确切 key 的点查              │ 范围扫描、key 可能不存在  │
+  └──────────┴──────────────────────────────────┴───────────────────────────┘
+
+  性能差异来源
+
+  即使 seek_nexts=0，seekrandom 也比 readrandom 慢约 15-30%，原因：
+
+  1. 迭代器树分配: 每次 Seek 创建/复用 ArenaWrappedDBIter + MergingIterator +
+  所有子迭代器
+  2. SeekImpl vs SeekForGetImpl: 二分查找 vs 哈希查找
+  3. DBIter 开销: 每条 key 都需要 ParseKey + IsVisible + CompareKeyForSkip 判断
+  4. 无 Row Cache 快捷路径
+  5. MergingIterator 堆维护: 即使只取一个 key，也需要堆操作
+
+  如果你的场景是：
+  - KV 点查 ("我知道 key，给我 value") → readrandom / DB::Get()
+  - 范围查询 ("找到 >= key 的第一个记录并扫描") → seekrandom / Iterator
+  - compaction、内部遍历 → Iterator 路径
+
+✻ Brewed for 2m 11s
+
+❯ 在indexblock的hashsearch方法中，为什么使用前缀定位到具体的某一个hash桶后，可  
+  以使用二分查找对桶内的block进行查找，桶内的block信息是有序的吗？              
+
+  Thought for 12s, searched for 3 patterns, read 3 files (ctrl+o to expand)
+
+● Now let me find where the hash index results are consumed — the code that uses
+  GetBlocks to do the actual lookup with binary search.
+
+  Thought for 28s, searched for 4 patterns, read 3 files (ctrl+o to expand)
+
+● 现在我有了完整的理解。让我详细解释。
+
+  ---
+  IndexBlock Hash Search 中桶内二分查找的原理解析
+
+  一、核心问题
+
+  你的问题可以拆成两个：
+  1. Hash 桶内的 block 信息是有序的吗？
+  2. 为什么可以二分查找？
+
+  简短回答：是的，同一个 hash 桶内的 block IDs 是按 升序排列的，而且每个 block
+  在 Index Block 中都有对应的 restart point（完整 key），所以可以直接对 block
+  进行二分查找。
+
+  ---
+  二、Hash Index 的整体结构
+
+  RocksDB 的 Hash Search Index 由三部分组成：
+
+  SST File
+  ├── Data Blocks (数据块)
+  ├── Index Block (索引块)
+  │   ├── restart point 0: key "apple"  → BlockHandle(offset=..., size=...)  ←
+  block 0
+  │   ├── restart point 1: key "banana" → BlockHandle(...)                   ←
+  block 1
+  │   ├── restart point 2: key "cherry" → BlockHandle(...)                   ←
+  block 2
+  │   ├── restart point 3: key "date"   → BlockHandle(...)                   ←
+  block 3
+  │   ├── ...
+  │   └── restart point N: key "zebra"  → BlockHandle(...)                   ←
+  block N
+  │
+  ├── Prefix Block (kHashIndexPrefixesBlock)
+  │   └── 存储所有前缀的字符串列表: "a", "b", "c", "d", ..., "z"
+  │
+  └── Prefix Meta Block (kHashIndexPrefixesMetadataBlock)
+      └── 每条记录: [prefix_size, entry_index, num_blocks]
+          │              │             │             └── 这个前缀跨越了多少个
+  index block
+          │              │             └── 起始 block 在 Index Block 中的位置
+          │              └── 前缀的字节大小
+          └── example: [1, 0, 1]  代表 "a" 前缀从 block 0 开始，跨 1 个 block
+                       [1, 1, 2]  代表 "b" 前缀从 block 1 开始，跨 2 个 block
+
+  ---
+  三、Hash 桶的构建过程
+
+  关键代码在 BlockPrefixIndex::Builder::Finish()
+  (block_prefix_index.cc:85-160)：
+
+  Step 1: 收集每个前缀的 block 范围
+
+  在 BlockPrefixIndex::Create() 中（block_prefix_index.cc:169-208），从 Prefix
+  Meta Block 中读取每条记录：
+
+  // 每条记录: {prefix, start_block(entry_index), num_blocks}
+  builder.Add(prefix, entry_index, num_blocks);
+  // 例如: Add("apple_prefix", 0, 1)  → 前缀 "a" 对应的 block 范围 [0, 0]
+  //       Add("banana_prefix", 1, 2) → 前缀 "b" 对应的 block 范围 [1, 2]
+
+  Step 2: 哈希分桶 + 合并连续记录
+
+  BlockPrefixIndex* Builder::Finish() {
+      // 哈希桶数量 ≈ 前缀数量 + 1
+      uint32_t num_buckets = prefixes_.size() + 1;
+
+      // 将每个前缀哈希到一个桶，建立链表
+      std::vector<PrefixRecord*> prefixes_per_bucket(num_buckets, nullptr);
+      for (PrefixRecord* current : prefixes_) {
+          uint32_t bucket = PrefixToBucket(current->prefix, num_buckets);
+          //      = Hash(prefix) % num_buckets
+
+          // ★ 关键优化：合并相邻的 block 范围
+          PrefixRecord* prev = prefixes_per_bucket[bucket];
+          if (prev) {
+              auto distance = current->start_block - prev->end_block;
+              if (distance <= 1) {
+                  // 前缀的 block 范围"连续"或"紧邻" → 合并为一个大区间
+                  prev->end_block = current->end_block;
+                  prev->num_blocks = prev->end_block - prev->start_block + 1;
+                  continue;  // 不创建新节点，合并到现有记录中
+              }
+          }
+          // 无法合并 → 链到桶的最前面
+          current->next = prev;                 // 链表头插法
+          prefixes_per_bucket[bucket] = current;
+      }
+
+  这里的关键：如果两个不同前缀哈希到了同一个桶，且它们的 block 
+  范围连续（distance ≤ 
+  1），就直接合并为一个更大的区间。如果不连续，它们作为链表中不同的节点存在。
+
+  Step 3: 输出有序的 block ID 数组
+
+      // 为每个桶构建输出数组
+      for (uint32_t i = 0; i < num_buckets; i++) {
+          if (num_blocks == 0) {
+              buckets[i] = kNoneBlock;                 // 空桶
+          } else if (num_blocks == 1) {
+              buckets[i] = prefixes_per_bucket[i]->start_block;  // 单 
+  block，直接存
+          } else {
+              // ★ 多 block：存入 block_array_buffer_
+              buckets[i] = EncodeIndex(offset);        // 存指针（高位标记）
+              block_array_buffer[offset] = num_blocks;  // 第一项存数量
+              uint32_t* last_block = &block_array_buffer[offset + num_blocks];
+
+              auto current = prefixes_per_bucket[i];    // 链表头（最新的前缀）
+              while (current != nullptr) {
+                  // ★ 从 end_block 到 start_block 降序填充，但 last_block 
+  从尾部向前移动
+                  for (uint32_t iter = 0; iter < current->num_blocks; iter++) {
+                      *last_block = current->end_block - iter;
+                      last_block--;  // 指针前移
+                  }
+                  current = current->next;  // 遍历链表下一节点（更老的前缀）
+              }
+          }
+      }
+
+  关键分析：这个填充过程保证了 block IDs 的升序排列。
+
+  举例：假设桶内有两个 PrefixRecord：
+  - Record A (较新): start_block=6, end_block=10, num_blocks=5 (前缀 "x")
+  - Record B (较旧): start_block=0, end_block=2, num_blocks=3 (前缀 "a")
+  - 链表顺序: A → B (A 是头)
+
+  填充过程：
+  初始: last_block 指向 array[offset + 8]  (因为总共有 8 个 block)
+
+  处理 Record A (end_block=10, start_block=6):
+    iter=0: array[offset + 8] = 10,   last_block → offset + 7
+    iter=1: array[offset + 7] = 9,    last_block → offset + 6
+    iter=2: array[offset + 6] = 8,    last_block → offset + 5
+    iter=3: array[offset + 5] = 7,    last_block → offset + 4
+    iter=4: array[offset + 4] = 6,    last_block → offset + 3
+
+  处理 Record B (end_block=2, start_block=0):
+    iter=0: array[offset + 3] = 2,    last_block → offset + 2
+    iter=1: array[offset + 2] = 1,    last_block → offset + 1
+    iter=2: array[offset + 1] = 0,    last_block → offset + 0
+
+  最终 array:
+    [offset + 0] = num_blocks = 8
+    [offset + 1] = 0      ← block B 开始
+    [offset + 2] = 1
+    [offset + 3] = 2      ← block B 结束
+    [offset + 4] = 6      ← block A 开始 (注意有间隔 2→6)
+    [offset + 5] = 7
+    [offset + 6] = 8
+    [offset + 7] = 9
+    [offset + 8] = 10     ← block A 结束
+
+  结果：block IDs 严格升序排列 [0, 1, 2, 6, 7, 8, 9, 10]！
+
+  ---
+  四、桶内的二分查找
+
+  IndexBlockIter::SeekImpl() 选择查找方式（block.cc:372-401）：
+
+  void IndexBlockIter::SeekImpl(const Slice& target) {
+      if (prefix_index_) {
+          // ★ 有 hash index → 使用 PrefixSeek
+          bool prefix_may_exist = true;
+          ok = PrefixSeek(target, &index, &prefix_may_exist);
+          // ...
+          skip_linear_scan = true;  // restart interval 固定为 1，跳过线性扫描
+      } else {
+          // 无 hash index → 标准二分查找整个 Index Block
+          ok = BinarySeek<DecodeKeyV4>(seek_key, &index, &skip_linear_scan);
+      }
+  }
+
+  PrefixSeek() —— 哈希定位 + 桶内二分 (block.cc:851-873)
+
+  bool IndexBlockIter::PrefixSeek(const Slice& target, uint32_t* index,
+                                  bool* prefix_may_exist) {
+      Slice seek_key = target;
+
+      // Step 1: 哈希定位——提取 target 的前缀，找到对应的桶
+      uint32_t* block_ids = nullptr;
+      uint32_t num_blocks = prefix_index_->GetBlocks(target, &block_ids);
+      //        ↓
+      //  BlockPrefixIndex::GetBlocks() (block_prefix_index.cc:210-229):
+      //    prefix = internal_prefix_extractor_->Transform(key)
+      //    bucket = Hash(prefix) % num_buckets_
+      //    从 buckets_[bucket] 获取 block_ids 数组（已排序）
+
+      if (num_blocks == 0) {
+          // 桶为空 → 该前缀不可能存在
+          *prefix_may_exist = false;
+          return false;
+      } else {
+          // Step 2: 在桶内的 block_ids 数组上二分查找
+          return BinaryBlockIndexSeek(seek_key, block_ids, 0, num_blocks - 1,
+                                      index, prefix_may_exist);
+      }
+  }
+
+  BinaryBlockIndexSeek() —— 对 block IDs 进行二分查找 (block.cc:769-848)
+
+  bool IndexBlockIter::BinaryBlockIndexSeek(const Slice& target,
+                                            uint32_t* block_ids,  // ★ 已排序的 
+  block ID 数组
+                                            uint32_t left, uint32_t right,
+                                            uint32_t* index, ...) {
+      // ★ 标准二分查找模板
+      while (left <= right) {
+          uint32_t mid = (right + left) / 2;
+
+          int cmp = CompareBlockKey(block_ids[mid], target);
+          //        ↓
+          //  CompareBlockKey(block_index, target) (block.cc:749-765):
+          //    1. 根据 block_index 定位到 Index Block 中对应的 restart point
+          //       region_offset = GetRestartPoint(block_index)
+          //    2. 解码该 restart point 处的完整 key
+          //    3. 与 target 比较
+          //
+          //    ★ 关键：Index Block 中的每个 restart point 存储了完整 key
+          //       （非 delta 编码），所以可以直接对任意 block index 进行比较
+
+          if (cmp < 0) {
+              left = mid + 1;    // target > mid → 去右边找
+          } else {
+              if (left == right) break;
+              right = mid;       // target ≤ mid → 去左边找（包含 mid）
+          }
+      }
+      // ...
+      *index = block_ids[left];  // 返回第一个 key ≥ target 的 block
+      return true;
+  }
+
+  ---
+  五、为什么桶内的 block 是有序的？—— 完整逻辑链
+
+  ┌───────────────┬─────────────────────────────────────────────────────────┐
+  │     步骤      │                          说明                           │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │ 1. Index      │ Index Block 中的 restart point 按 key 严格递增。每个    │
+  │ Block         │ restart point 对应一个 data block 的分隔 key。block ID  │
+  │ 天然有序      │ 越大，对应分隔 key 越大。                               │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │ 2. 前缀有序 → │ 前缀是按字典序排列的，且每个前缀对应一个连续的 block    │
+  │  block IDs    │ 范围。因此 block IDs 与 key 的大小关系是单调递增的。    │
+  │ 有序          │                                                         │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │ 3. 哈希不破坏 │ 哈希只是将不同的前缀映射到不同的桶。桶内可能包含多个不  │
+  │ 有序性        │ 连续区间（hash 冲突 + 不同前缀的 block                  │
+  │               │ 范围），但构建时保证 block IDs 在桶内升序排列。         │
+  ├───────────────┼─────────────────────────────────────────────────────────┤
+  │ 4. Restart    │ Index Block 的每个 restart point 存储完整 key（非 delta │
+  │ Point         │  编码），因此 CompareBlockKey(block_index, target) 可以 │
+  │ 支持随机访问  │  O(1) 解码并比较任意位置的 key。这使二分查找成为可能。  │
+  └───────────────┴─────────────────────────────────────────────────────────┘
+
+  ---
+  六、图示总结
+
+                                 user_key = "cherry@seq"
+                                       │
+                           ┌───────────┴───────────┐
+                           │  prefix_extractor      │
+                           │  Transform("cherry")   │
+                           │  → prefix = "c"        │
+                           └───────────┬───────────┘
+                                       │
+                           ┌───────────┴───────────┐
+                           │  Hash("c") % N         │
+                           │  → bucket = 5          │
+                           └───────────┬───────────┘
+                                       │
+                      ┌────────────────┴────────────────┐
+                      │  BlockPrefixIndex::GetBlocks()   │
+                      │  buckets_[5] → block_array       │
+                      │  num_blocks = 3                  │
+                      │  block_ids = [4, 5, 7]  ← 有序! │
+                      └────────────────┬────────────────┘
+                                       │
+                      ┌────────────────┴────────────────┐
+                      │  BinaryBlockIndexSeek()          │
+                      │  在 [4, 5, 7] 上二分查找         │
+                      │                                  │
+                      │  mid=1 → CompareBlockKey(5, "c") │
+                      │    读取 Index Block restart      │
+                      │    point 5 的 key → "date"       │
+                      │    "date" > "cherry" → right=1   │
+                      │                                  │
+                      │  mid=0 → CompareBlockKey(4, "c") │
+                      │    读取 restart point 4 → "cherry"│
+                      │    "cherry" ≥ "cherry" → 命中!   │
+                      │                                  │
+                      │  *index = 4                      │
+                      └──────────────────────────────────┘
+                                       │
+                      ┌────────────────┴────────────────┐
+                      │  从 Index Block 读取             │
+                      │  restart point 4 的 value        │
+                      │  → BlockHandle (data block 4)    │
+                      │  → 读取 Data Block 4 进行查找    │
+                      └──────────────────────────────────┘
+
+  ---
+  七、总结
+
+  桶内的 block 信息是有序的，因为：
+
+  1. 构建时保证升序：BlockPrefixIndex::Builder::Finish() 从链表尾（block ID
+  小）到链表头（block ID 大）依次填充，最终 block_array_buffer 中 block IDs
+  严格升序。
+  2. Index Block 的 restart point 天然有序：每个 restart point 存储完整 key，且
+  key 随 block ID 单调递增。这使得 CompareBlockKey() 可以 O(1) 解码任意位置的
+  key 进行比较。
+  3. 二分查找的优势：无需线性扫描所有 block，桶内 O(log n)
+  定位到具体的数据块。相比于全 Index Block 二分，Hash Index 将搜索空间从 N
+  缩小到桶内的 n（通常 1~少数几个 block），大幅减少比较次数。
+
+✻ Crunched for 1m 41s
